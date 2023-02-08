@@ -1,57 +1,60 @@
-import pandas as pd
 import re
+import pandas as pd
 from cleanco import basename
 from config import connect_to_sqldb, connect_to_mongodb
-import json
 from bson import json_util
 
 
 def clean_company_names(company_name):
-    company_name = re.sub(r'[,\(\)\"]', '', company_name)
-    company_name = re.sub(r'\s-.*', '', company_name)
-    company_name = basename(company_name).title()
-    company_name = re.sub(r'\b(Ltd|Limited)\b', '', company_name).strip()
-    company_name = re.sub(r'([A-Z]+)\s([A-Z]+)', lambda m: m.group(1) + ' & ' + m.group(2), company_name)
+    # Clean unwanted characters: commas and full text after commas, brackets and text in them, quotation marks, dashes when not part of the company name.
+    company_name = re.sub(r'[,\(\)\[\]\"\']', '', company_name)
+    # Clean legal entity: LIMITED, LTD., ltd. Limited, limited.
+    company_name = re.sub(r'(LTD|Limited)', '', company_name).strip()
+    # The name should only be with initial capital letters
+    company_name = company_name.title()
+    # If acronyms are used in the name, then the acronym should be in capital letters
+    company_name = re.sub(r'([A-Z][a-z]+)', lambda x: x.group(0).upper(), company_name)
     return company_name
-
 
 def update_db():
     conn = connect_to_sqldb()
-    c = conn.cursor()
+    cursor = conn.cursor()
 
+    # Read the data in chunks of 1000
     chunk_size = 1000
-    offset = 0
-    while True:
-        companies = pd.read_sql_query("SELECT * FROM companies LIMIT %d OFFSET %d" % (chunk_size, offset), conn)
-        if companies.empty:
-            break
-
-        companies = companies.apply(clean_company_names, axis=1)
-        companies.to_sql("companies", conn, if_exists="replace", index=False)
-
-        offset += chunk_size
-
-    conn.commit()
-    c.close()
+    chunk = pd.read_sql("SELECT * FROM companies", conn, chunksize=chunk_size)
+    for i, df in enumerate(chunk):
+        for index, row in df.iterrows():
+            company_name = row['name']
+            cleaned_name = clean_company_names(company_name)
+            # Update the cleaned name in the database
+            cursor.execute("UPDATE companies SET company_name_cleaned=? WHERE id=?", (cleaned_name, row['id']))
+        # Commit changes after every chunk
+        conn.commit()
+    cursor.close()
     conn.close()
 
-
 def write_to_mongodb():
-    conn = connect_to_mongodb()
-    companies_collection = conn["companies"]
-
-    companies = pd.read_sql_query("SELECT * FROM companies", connect_to_sqldb())
-    companies = companies.apply(clean_company_names, axis=1)
-
-    for index, row in companies.iterrows():
-        company_dict = row.to_dict()
-        companies_collection.update_one({"_id": company_dict["id"]}, {"$set": company_dict}, upsert=True)
-
+    db = connect_to_mongodb()
+    companies_collection = db.companies
+    conn = connect_to_sqldb()
+    df = pd.read_sql("SELECT * FROM companies", conn)
+    for index, row in df.iterrows():
+        company = {
+            'name': row['company_name_cleaned'],
+            'country_iso': row['country_iso'],
+            'city': row['city'],
+            'nace': row['nace'],
+            'website': row['website']
+        }
+        # Insert the company into the MongoDB collection
+        companies_collection.insert_one(company)
+    conn.close()
 
 def mongodb_to_html():
-    conn = connect_to_mongodb()
-    companies_collection = conn["companies"]
+    db = connect_to_mongodb()
+    companies_collection = db.companies
+    companies = companies_collection.find().limit(20)
+    return json.dumps(list(companies), default=json_util.default)
 
-    companies = list(companies_collection.find().limit(20))
-    return json.dumps(companies, default=json_util.default)
 
